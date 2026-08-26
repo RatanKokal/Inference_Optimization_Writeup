@@ -28,7 +28,7 @@ Participants could modify the inference stack, including batching, scheduling, q
 
 ## The Optimization Journey
 
-I treated the challenge as an end-to-end systems problem. I first established a baseline, then used profiling to identify bottlenecks and measured the effect of each major change.
+I approached the challenge as an end-to-end systems problem. I first established a baseline, then profiled the serving path and measured the effect of each major change.
 
 | Stage    | Main change                             |        Throughput |
 | -------- | --------------------------------------- | ----------------: |
@@ -51,9 +51,9 @@ I began by tuning vLLM’s engine parameters:
 * KV-cache block size
 * Quantization format
 
-The objective was to maximize useful GPU work without causing an out-of-memory error.
+The objective was to maximize GPU utilization without causing an out-of-memory error.
 
-The workload allowed up to 50 concurrent requests, so I matched the engine configuration to that constraint:
+The configuration was matched to the fixed workload:
 
 ```bash
 --max-num-seqs 50
@@ -63,43 +63,43 @@ The workload allowed up to 50 concurrent requests, so I matched the engine confi
 --block-size 32
 ```
 
-The `max-num-batched-tokens` value was chosen to match the workload:
+The batch-token limit was chosen based on:
 
 ```text
 50 requests × approximately 512 tokens = 25,600 tokens
 ```
 
-I also explored AWQ quantization to reduce memory usage and improve the efficiency of matrix multiplications.
+I also explored AWQ quantization to reduce memory usage and improve matrix multiplication efficiency.
 
-These initial changes increased throughput from approximately **3,332 to 3,800 tokens per second**.
+These changes increased throughput from approximately **3,332 to 3,800 tokens per second**.
 
 ## Stage 2: CUDA Graph Capture and Sampling Overhead
 
-The benchmark sent requests at an effectively infinite rate. After reaching steady state, the hot path would frequently contain all 50 requests.
+The benchmark sent requests at an effectively infinite rate. Once the system reached steady state, the hot path frequently contained all 50 requests.
 
-vLLM uses CUDA graphs to reduce CPU dispatch and kernel-launch overhead. However, CUDA graphs are captured for predefined batch sizes. If the runtime batch size does not match an available capture size, execution can fall back to a slower path.
+vLLM uses CUDA graphs to reduce CPU dispatch and kernel-launch overhead. However, graphs must be captured for predefined batch sizes. If the runtime batch size does not match an available capture size, execution can fall back to a slower path.
 
-I therefore added capture sizes covering the expected workload, including the full batch size:
+I added capture sizes covering the expected workload, including the full batch size:
 
 ```text
 [1, 2, 4, 8, 16, 24, 32, 40, 50]
 ```
 
-This was especially important in Google Colab, where the CPU environment was relatively weak. The T4 was capable of executing the kernels quickly, but CPU-side dispatch and kernel-launch overhead became a larger fraction of total execution time.
+This was especially important in Google Colab, where the CPU environment was relatively weak. CPU-side dispatch and kernel-launch overhead formed a larger fraction of total execution time than they would in a stronger server environment.
 
-I also observed that non-zero-temperature inference launched additional sampling-related work, including softmax operations. Since stochastic sampling was not required for the benchmark, I used greedy decoding:
+I also observed that non-zero-temperature inference launched additional sampling-related work, including softmax operations. Since stochastic sampling was not required, I used greedy decoding:
 
 ```text
 temperature = 0
 ```
 
-CUDA graph coverage and the sampling change increased throughput to approximately **4,300 tokens per second**.
+These changes increased throughput to approximately **4,300 tokens per second**.
 
 ## Stage 3: Eliminating CPU–GPU Synchronization
 
-The next bottleneck emerged through Nsight Systems profiling.
+Nsight Systems profiling revealed hidden CPU–GPU synchronization in vLLM’s attention metadata path.
 
-Some attention metadata was being accessed through implicit GPU-to-CPU transfers. In particular, calls such as `.cpu()` could force the CPU to wait for outstanding GPU work before continuing. This created pipeline stalls during decoding.
+Some sequence-length metadata was accessed through implicit `.cpu()` operations. These forced the CPU to wait for GPU work to complete before continuing, creating pipeline stalls.
 
 I modified the execution path to:
 
@@ -108,10 +108,10 @@ I modified the execution path to:
 * Replace blocking copies with asynchronous copies where possible
 * Update GPU-side block-table metadata using non-blocking transfers
 * Avoid unnecessary full-table synchronization
-* Remove redundant initialization of padded block-table rows
+* Remove redundant padded block-table initialization
 * Compile sampling logic to reduce Python overhead
 
-For example, block-table updates were changed to use asynchronous copies:
+For example:
 
 ```python
 self.block_table.gpu[row_idx, start:start + num_blocks].copy_(
@@ -120,34 +120,22 @@ self.block_table.gpu[row_idx, start:start + num_blocks].copy_(
 )
 ```
 
-I also removed redundant initialization of padded rows:
+I also removed redundant initialization:
 
 ```python
 # Removed
 blk_table_tensor[num_reqs:num_reqs_padded].fill_(-1)
 ```
 
-The profiler traces showed a reduction in `Memset` events:
+The goal was to allow CPU-side preparation and GPU execution to overlap instead of forcing the CPU to wait.
 
-* **Before:** 2,243 `Memset` events
-* **After:** 2,048 `Memset` events
-* **Reduction:** 8.7%
-
-![Before synchronization and metadata optimizations](./nsys-before.png)
-
-*Before: 2,243 `Memset` events detected.*
-
-![After synchronization and metadata optimizations](./nsys-after.png)
-
-*After: 2,048 `Memset` events detected.*
-
-These changes reduced synchronization and metadata overhead, increasing throughput to approximately **4,500–4,600 tokens per second**.
+These changes increased throughput to approximately **4,500–4,600 tokens per second**.
 
 ## Stage 4: Discovering the Scheduler Bottleneck
 
-After reducing synchronization overhead, I profiled the complete serving workload again.
+After reducing synchronization overhead, I profiled the serving workload again.
 
-The trace showed that the scheduler was frequently producing fragmented batches. Instead of consistently processing the available requests together, it often launched work with smaller batches:
+The trace showed that the scheduler was producing fragmented batches. Instead of consistently processing the available requests together, it repeatedly launched smaller batches:
 
 ```text
 Before:
@@ -157,25 +145,33 @@ Desired:
 50 → 50 → 50 → 50 → ...
 ```
 
-This reduced GPU utilization and increased scheduling and kernel-launch overhead.
+Because requests arrived continuously and had identical input and output lengths, the scheduler could briefly wait for additional requests without significantly affecting performance.
 
-The workload was highly regular: requests arrived continuously, the concurrency was fixed at 50, and every request had the same input and output lengths. This meant the scheduler could briefly wait for more requests without significantly affecting overall performance.
-
-I patched vLLM with an adaptive batching mechanism controlled by:
+I added an adaptive batching mechanism controlled by:
 
 ```bash
 VLLM_MIN_QUEUED_REQS=50
 VLLM_MIN_QUEUED_TIMEOUT=10ms
 ```
 
-When the engine was idle, the scheduler waited until either:
+The scheduler waited until either:
 
-1. The queue reached the minimum number of requests, or
-2. The timeout expired.
+1. The queue reached 50 requests, or
+2. The 10 ms timeout expired.
 
-This allowed the system to form larger and more predictable batches while preventing indefinite waiting.
+This allowed it to form larger and more predictable batches while avoiding indefinite delays.
 
-The change also improved CUDA graph reuse because the runtime more consistently operated at captured batch sizes.
+The Nsight traces showed that the scheduler execution count decreased from approximately **2,243 to 2,048**.
+
+![Scheduler before adaptive batching](./scheduler-before.png)
+
+*Before adaptive batching: approximately 2,243 scheduler execution events.*
+
+![Scheduler after adaptive batching](./scheduler-after.png)
+
+*After adaptive batching: approximately 2,048 scheduler execution events.*
+
+The more regular execution pattern also improved CUDA graph reuse.
 
 Throughput increased to approximately **5,600 tokens per second**.
 
@@ -185,7 +181,7 @@ I next switched from standard AWQ execution to AWQ-Marlin.
 
 Quantization reduces the model’s memory footprint, but the execution kernel is equally important. Marlin provides specialized kernels for AWQ-quantized matrix multiplications, reducing the latency of the dominant GEMM operations on the T4.
 
-This improved throughput from approximately **5,600 to 5,800 tokens per second**.
+This increased throughput from approximately **5,600 to 5,800 tokens per second**.
 
 The final serving configuration included:
 
@@ -214,9 +210,9 @@ Many tensor-core-oriented implementations are optimized for power-of-two dimensi
 
 I modified the attention path to use a SIMT-oriented implementation for this case and patched FlashInfer to support the group size of 7 directly.
 
-This allowed the attention computation to better match the actual tensor shape instead of forcing it through a less suitable execution path.
+This allowed the attention computation to better match Qwen’s actual tensor shape.
 
-Throughput reached approximately:
+Throughput reached:
 
 ```text
 6,822 output tokens per second
@@ -244,7 +240,9 @@ vllm bench serve \
 
 The benchmark used an effectively infinite request rate and a maximum concurrency of 50.
 
-For profiling, I ran a separate hot benchmark under Nsight Systems after the warm-up. The profiled run was not used for throughput reporting because profiler instrumentation adds overhead.
+For profiling, I ran a separate hot benchmark under Nsight Systems. The profiled run was not used for throughput reporting because profiler instrumentation adds overhead.
+
+All configurations used the same model, workload, GPU, and benchmark settings.
 
 ## Final Results
 
@@ -256,13 +254,13 @@ Compared with the original baseline, the final system achieved:
 | P99 time-to-first-token   |    **−73%** |
 | P99 time-per-output-token |    **−54%** |
 
-The main throughput progression was:
+The overall throughput progression was:
 
 ```text
 3,332 tok/s → 6,822 tok/s
 ```
 
-This improvement was achieved on the same Tesla T4, without changing the model, hardware, workload, or evaluation setup.
+This improvement was achieved on the same Tesla T4 without changing the model, hardware, workload, or evaluation setup.
 
 ## What Made the Difference?
 
@@ -289,7 +287,7 @@ The largest gains came from removing inefficiency between components.
 
 One promising direction is multi-token decoding.
 
-The benchmark workload is highly regular, with 50 similar requests and fixed input and output lengths. Instead of synchronizing between the CPU and GPU after every generated token, the system could attempt to generate several tokens before synchronizing and validating the result.
+The workload is highly regular, with 50 similar requests and fixed input and output lengths. Instead of synchronizing between the CPU and GPU after every generated token, the system could attempt to generate several tokens before synchronizing and validating the result.
 
 For example, it could attempt to predict eight tokens before performing a synchronization step. This could reduce synchronization frequency and hide more CPU-side overhead.
 
