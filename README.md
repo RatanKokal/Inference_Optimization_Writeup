@@ -163,11 +163,11 @@ The Nsight traces showed that the scheduler execution count decreased from appro
 
 ![Scheduler before adaptive batching](./nsys_before.png)
 
-*Before adaptive batching: approximately 2,243 scheduler execution events.*
+*Before adaptive batching: 2,243 matching events in the Nsight trace.*
 
 ![Scheduler after adaptive batching](./nsys_after.png)
 
-*After adaptive batching: approximately 2,048 scheduler execution events.*
+*After adaptive batching: 2,048 matching events in the Nsight trace.*
 
 The more regular execution pattern also improved CUDA graph reuse.
 
@@ -248,7 +248,7 @@ Compared with the original baseline, the final system achieved:
 
 | Metric                    | Improvement |
 | ------------------------- | ----------: |
-| Output throughput         |   **+118%** |
+| Output throughput         |   **+105%** |
 | P99 time-to-first-token   |    **−73%** |
 | P99 time-per-output-token |    **−54%** |
 
@@ -259,6 +259,20 @@ The overall throughput progression was:
 ```
 
 This improvement was achieved on the same Tesla T4 without changing the model, hardware, workload, or evaluation setup.
+
+## Approaches That Did Not Help
+
+Not every inference optimization was suitable for this workload.
+
+### Automatic Prefix Caching
+
+The benchmark used independently generated random prompts, so there was little or no reusable prefix across requests. Automatic Prefix Caching therefore could not provide meaningful benefits and was not useful for this setup.
+
+### Speculative Decoding
+
+Speculative decoding was also unlikely to help. It requires additional draft-model execution and verification work, increasing CPU-side scheduling and coordination overhead. Since the Colab CPU was already a bottleneck, the extra work would likely have outweighed any reduction in GPU decoding time.
+
+These approaches reinforced an important lesson: an optimization must match the workload and the system’s actual bottleneck.
 
 ## What Made the Difference?
 
