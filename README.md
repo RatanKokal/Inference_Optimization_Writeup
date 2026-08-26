@@ -262,6 +262,6 @@ The experience reinforced a broader principle:
 > High-performance inference is not about optimizing one component in isolation. It is about making the scheduler, runtime, memory system, CUDA graphs, quantization kernels, and attention implementation work together.
 
 
-![H2LooP Bear the Tokens winner award](./assets/bear-the-tokens-winner.jpg)
+![H2LooP Bear the Tokens winner award](./bear_the_tokens_winner.jpg)
 
 Grateful to be awarded first place in H2LooP’s Bear the Tokens challenge for “engineering excellence under constraint.”
