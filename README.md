@@ -24,8 +24,6 @@ The objective was to push output throughput as high as possible while satisfying
 
 Participants could modify the inference stack, including batching, scheduling, quantization, CUDA kernels, memory management, and speculative decoding, but the model, hardware, workload, and evaluation setup were fixed.
 
-[Official challenge page](https://www.h2loop.ai/contests/bear-the-tokens)
-
 ## The Optimization Journey
 
 I approached the challenge as an end-to-end systems problem. I first established a baseline, then profiled the serving path and measured the effect of each major change.
@@ -163,11 +161,11 @@ This allowed it to form larger and more predictable batches while avoiding indef
 
 The Nsight traces showed that the scheduler execution count decreased from approximately **2,243 to 2,048**.
 
-![Scheduler before adaptive batching](./scheduler-before.png)
+![Scheduler before adaptive batching](./nsys_before.png)
 
 *Before adaptive batching: approximately 2,243 scheduler execution events.*
 
-![Scheduler after adaptive batching](./scheduler-after.png)
+![Scheduler after adaptive batching](./nsys_after.png)
 
 *After adaptive batching: approximately 2,048 scheduler execution events.*
 
